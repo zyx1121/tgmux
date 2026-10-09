@@ -7,10 +7,18 @@ export type Message = {
   from?: { id: number; username?: string };
   chat: { id: number; type: string; title?: string; is_forum?: boolean };
   text?: string;
+  caption?: string;
+  photo?: { file_id: string; file_size?: number }[];
+  document?: FileRef & { file_name?: string };
+  video?: FileRef;
+  audio?: FileRef & { file_name?: string };
+  voice?: FileRef & { duration?: number };
   forum_topic_closed?: object;
   forum_topic_created?: { name: string };
   reply_markup?: { inline_keyboard?: { text: string; callback_data?: string }[][] };
 };
+
+type FileRef = { file_id: string; file_size?: number; mime_type?: string };
 
 export type CallbackQuery = { id: string; from: { id: number }; data?: string; message?: Message };
 
@@ -56,6 +64,32 @@ export class Telegram {
       // Editing to identical text is a harmless no-op; anything else is worth a log line.
       if (!String(e).includes("not modified")) console.error(e);
     });
+  }
+
+  /** Download a file the user sent (Bot API limit: 20 MB) to `dest`. */
+  async download(fileId: string, dest: string) {
+    const file = await this.call<{ file_path: string }>("getFile", { file_id: fileId });
+    const res = await fetch(`https://api.telegram.org/file/bot${this.token}/${file.file_path}`);
+    if (!res.ok) throw new Error(`download failed: ${res.status}`);
+    await Bun.write(dest, res);
+    return file.file_path;
+  }
+
+  /** Send a file from disk: images as photos (shown inline), everything else as a document. */
+  async sendFile(chat: number, thread: number | undefined, path: string) {
+    const file = Bun.file(path);
+    const name = path.split("/").pop()!;
+    const photo = /\.(png|jpe?g|webp)$/i.test(name) && file.size < 10_000_000;
+    const form = new FormData();
+    form.set("chat_id", String(chat));
+    if (thread) form.set("message_thread_id", String(thread));
+    form.set(photo ? "photo" : "document", file, name);
+    const res = await fetch(`https://api.telegram.org/bot${this.token}/${photo ? "sendPhoto" : "sendDocument"}`, {
+      method: "POST",
+      body: form,
+    });
+    const data = (await res.json()) as { ok: boolean; description?: string };
+    if (!data.ok) throw new Error(`send ${name}: ${data.description}`);
   }
 
   async sendDocument(chat: number, thread: number | undefined, name: string, content: string) {

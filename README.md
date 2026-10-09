@@ -35,7 +35,9 @@ Then in Telegram:
 | Main chat | any text | Runs in bash; output streams as a draft, long output also arrives as a file |
 | Main chat | `/claude [prompt]` | New topic with Claude Code, optionally starting with a prompt |
 | Main chat | `/stop` or the draft's stop button | Interrupts the running command |
+| Main chat | `/get <path>` | Sends a file from the machine; files you send are saved to `~/work/inbox` |
 | Topic | any text or `/command` | Typed into Claude Code; text and tool steps stream as a draft, the stop button sends Esc |
+| Topic | photo or file | Saved to `~/work/inbox` and handed to Claude with your caption; files Claude puts in `$TGMUX_OUTBOX` come back when the turn ends |
 | Topic | `/screen` | Sends the current terminal screen |
 | Topic | `/keys Down Enter` | Presses keys (tmux key names), for pickers and menus |
 | Topic | `/kill` | Ends the session and closes the topic |
