@@ -1,5 +1,5 @@
 [Unit]
-Description=tgmux: Telegram forum group as a shell and Claude Code multiplexer
+Description=tgmux: private Telegram chat as a shell and Claude Code multiplexer
 After=network-online.target
 Wants=network-online.target
 
