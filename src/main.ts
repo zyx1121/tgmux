@@ -317,7 +317,7 @@ async function onHook(event: string, thread: number, body: any) {
     await deliverOutbox(thread);
     const reply = String(body.last_assistant_message ?? "").trim();
     if (reply) {
-      await tg.sendLong(CHAT, thread, reply, asked);
+      await tg.sendMarkdown(CHAT, thread, reply, asked);
       nameTopic(thread, reply).catch(console.error);
     }
   }

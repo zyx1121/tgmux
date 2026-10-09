@@ -59,6 +59,21 @@ export class Telegram {
     for (const part of chunk(text || "(empty)")) await this.send(chat, thread, part, quote(replyTo));
   }
 
+  /** Send Markdown as a Rich Message (real headings, lists, code blocks); falls back to plain text. */
+  async sendMarkdown(chat: number, thread: number | undefined, markdown: string, replyTo?: number) {
+    for (const part of chunkMarkdown(markdown || "(empty)")) {
+      await this.call("sendRichMessage", {
+        chat_id: chat,
+        message_thread_id: thread,
+        rich_message: { markdown: part },
+        ...quote(replyTo),
+      }).catch((e) => {
+        console.error(String(e));
+        return this.send(chat, thread, part, quote(replyTo));
+      });
+    }
+  }
+
   edit(chat: number, message: number, text: string, extra: Record<string, unknown> = {}) {
     return this.call("editMessageText", { chat_id: chat, message_id: message, text, ...extra }).catch((e) => {
       // Editing to identical text is a harmless no-op; anything else is worth a log line.
@@ -118,6 +133,25 @@ export function chunk(text: string, size = MAX_TEXT): string[] {
 /** Reply to the message that asked, so the answer quotes it instead of the topic's opening line. */
 export function quote(messageId?: number) {
   return messageId ? { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } } : {};
+}
+
+/** Like chunk, but a code fence cut in two is closed and reopened so both parts render. */
+export function chunkMarkdown(text: string, size = MAX_TEXT - 16): string[] {
+  const parts = chunk(text, size);
+  let open = "";
+  return parts.map((part) => {
+    let out = open ? `${open}\n${part}` : part;
+    const fences = part.match(/^```.*$/gm) ?? [];
+    let inside = !!open;
+    let lang = open;
+    for (const f of fences) {
+      inside = !inside;
+      lang = inside ? f : "";
+    }
+    open = inside ? lang : "";
+    if (inside) out += "\n```";
+    return out;
+  });
 }
 
 export function escapeHtml(s: string) {
