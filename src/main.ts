@@ -1,7 +1,7 @@
 // tgmux: your private chat with the bot, in topic mode, as a terminal multiplexer.
 // The `shell` topic = a persistent bash. Every other topic = interactive Claude Code in a tmux window.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildMenu, claudeCommands, unalias } from "./commands";
@@ -19,6 +19,12 @@ const STATE_DIR = env("TGMUX_STATE", join(homedir(), ".local/state/tgmux"));
 const PORT = Number(env("TGMUX_PORT", "8765"));
 const CLAUDE = env("TGMUX_CLAUDE", join(homedir(), ".local/bin/claude"));
 const HOOK_KEY = crypto.randomUUID();
+const INBOX = join(WORKDIR, "inbox");
+const outbox = (thread: number) => join(STATE_DIR, "outbox", `t${thread}`);
+const OUTBOX_PROMPT =
+  "You are being used through Telegram (tgmux). Files the user sends are saved under ./inbox and their paths " +
+  "appear in the message. To send a file back to the user, copy it into the directory in the TGMUX_OUTBOX " +
+  "environment variable; everything there is delivered when your turn ends.";
 
 if (!TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 mkdirSync(WORKDIR, { recursive: true });
@@ -77,11 +83,13 @@ const liveOf = (t: number) => live.get(t) ?? (live.set(t, {}), live.get(t)!);
 
 async function startClaude(thread: number, resume?: string) {
   const started = new Promise<void>((r) => (liveOf(thread).started = r));
-  const cmd = [CLAUDE, "--settings", SETTINGS_FILE, "--permission-mode", "bypassPermissions"];
+  mkdirSync(outbox(thread), { recursive: true });
+  const cmd = [CLAUDE, "--settings", SETTINGS_FILE, "--permission-mode", "bypassPermissions", "--append-system-prompt", OUTBOX_PROMPT];
   if (resume) cmd.push("--resume", resume);
   tmux.openWindow(thread, WORKDIR, cmd, {
     TGMUX_THREAD: String(thread),
     TGMUX_HOOK_KEY: HOOK_KEY,
+    TGMUX_OUTBOX: outbox(thread),
     CLAUDE_CODE_OAUTH_TOKEN: env("CLAUDE_CODE_OAUTH_TOKEN"),
   });
   // Wait for the SessionStart hook, then give the prompt box a moment to render.
@@ -207,6 +215,37 @@ function typing(thread: number | undefined) {
   return () => clearInterval(timer);
 }
 
+// ---------- files: Telegram -> ./inbox, TGMUX_OUTBOX -> Telegram ----------
+
+/** Save an attachment to the inbox; returns its path, or undefined for a message without one. */
+async function saveAttachment(msg: Message) {
+  const f = msg.document ?? msg.video ?? msg.audio ?? msg.photo?.at(-1);
+  if (!f) return;
+  const original = (msg.document?.file_name ?? msg.audio?.file_name) || undefined;
+  mkdirSync(INBOX, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+  const tmp = join(INBOX, `${stamp}-${msg.message_id}`);
+  const remote = await tg.download(f.file_id, tmp);
+  const ext = remote.includes(".") ? `.${remote.split(".").pop()}` : "";
+  const name = original ? `${stamp}-${original.replace(/[^\w.-]+/g, "_")}` : `${stamp}-${msg.message_id}${ext}`;
+  const dest = join(INBOX, name);
+  if (dest !== tmp) Bun.spawnSync(["mv", tmp, dest]);
+  return dest;
+}
+
+async function deliverOutbox(thread: number) {
+  const dir = outbox(thread);
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (!statSync(path).isFile()) continue;
+    await tg.sendFile(CHAT, thread, path).then(
+      () => rmSync(path),
+      (e) => tg.send(CHAT, thread, `Could not send ${name}: ${e.message ?? e} (kept in ${dir})`),
+    );
+  }
+}
+
 // ---------- AskUserQuestion: Claude's picker as inline buttons ----------
 
 type Question = { question: string; header?: string; options?: { label: string; description?: string }[] };
@@ -275,6 +314,7 @@ async function onHook(event: string, thread: number, body: any) {
     const asked = l.asked;
     react(asked, "👌");
     l.asked = undefined;
+    await deliverOutbox(thread);
     const reply = String(body.last_assistant_message ?? "").trim();
     if (reply) {
       await tg.sendLong(CHAT, thread, reply, asked);
@@ -345,9 +385,11 @@ const HELP = [
   "  any text: runs in bash (pipes, &&, & all work; cd persists)",
   "  /claude [prompt]: open a new Claude topic from here",
   "  /stop or the draft's stop button: interrupt the running command",
+  "  /get <path>: send a file from the machine; sending a file saves it to ~/work/inbox",
   "",
   "Claude topic",
   "  any text or /command: goes to Claude Code (the stop button sends Esc)",
+  "  photos and files: saved to ./inbox and handed to Claude; files Claude makes come back",
   "  /screen: show the terminal",
   "  /keys Down Enter: press keys (tmux key names)",
   "  /kill: end the session and close the topic",
@@ -365,13 +407,20 @@ async function onMessage(msg: Message) {
     tmux.closeWindow(thread);
     return;
   }
-  if (!msg.text) return;
-  const text = stripBotSuffix(msg.text);
+  const attachment = await saveAttachment(msg);
+  if (attachment && (thread === undefined || thread === state.shellThread)) {
+    react(msg.message_id, "👌");
+    return tg.send(CHAT, thread, `Saved to ${attachment}`, quote(msg.message_id));
+  }
+  const body = msg.text ?? msg.caption ?? "";
+  if (!body && !attachment) return;
+  const text = attachment ? `${body}\n\n[attached file: ${attachment}]`.trim() : stripBotSuffix(body);
   const cmd = parseCommand(text);
 
   if (thread === undefined || thread === state.shellThread) {
     if (cmd?.cmd === "claude") return newClaudeTopic(cmd.args);
     if (cmd?.cmd === "stop") return shell.interrupt();
+    if (cmd?.cmd === "get") return tg.sendFile(CHAT, thread, cmd.args.replace(/^~(?=\/)/, homedir()));
     if (cmd?.cmd === "help" || cmd?.cmd === "start") return tg.send(CHAT, state.shellThread, HELP);
     return runShell(text, msg.message_id);
   }
@@ -425,6 +474,7 @@ const OWN_COMMANDS = [
   { command: "keys", description: "tgmux: press keys, e.g. /keys Down Enter" },
   { command: "kill", description: "tgmux: end this Claude session" },
   { command: "stop", description: "tgmux: interrupt the shell" },
+  { command: "get", description: "tgmux: send a file, e.g. /get ~/work/out.png" },
   { command: "help", description: "tgmux: usage" },
 ];
 // The menu lists Claude Code's commands too; refreshed on every start, so new skills appear after a restart.
