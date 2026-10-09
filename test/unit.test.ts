@@ -39,3 +39,12 @@ test("buildMenu maps Claude names onto Telegram's charset and keeps tgmux comman
   expect(unalias("/code_review high", aliases)).toBe("/code-review high");
   expect(unalias("/model opus", aliases)).toBe("/model opus");
 });
+
+import { chunkMarkdown } from "../src/telegram";
+
+test("chunkMarkdown closes and reopens a code fence split across parts", () => {
+  const code = Array.from({ length: 30 }, (_, i) => `console.log(${i});`).join("\n");
+  const parts = chunkMarkdown(`intro\n\`\`\`ts\n${code}\n\`\`\`\nouter`, 200);
+  for (const p of parts) expect((p.match(/^```/gm) ?? []).length % 2).toBe(0);
+  expect(parts[1].startsWith("```ts\n")).toBe(true);
+});
