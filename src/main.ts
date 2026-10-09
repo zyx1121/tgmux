@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildMenu, claudeCommands, unalias } from "./commands";
 import { Draft } from "./draft";
+import * as otel from "./otel";
 import { Shell } from "./shell";
 import { Telegram, escapeHtml, quote, parseCommand, stripBotSuffix, type CallbackQuery, type Message, type Update } from "./telegram";
 import * as tmux from "./tmux";
@@ -78,7 +79,14 @@ function writeClaudeSettings() {
 
 // ---------- per-topic runtime (not persisted) ----------
 
-type Live = { draft?: Draft; started?: () => void; screenTimer?: Timer; asked?: number };
+type Live = {
+  draft?: Draft;
+  started?: () => void;
+  screenTimer?: Timer;
+  asked?: number;
+  turnEnd?: ReturnType<typeof otel.span>;
+  tools?: number;
+};
 const live = new Map<number, Live>();
 const liveOf = (t: number) => live.get(t) ?? (live.set(t, {}), live.get(t)!);
 
@@ -105,6 +113,7 @@ async function randomIcon(): Promise<string | undefined> {
 }
 
 async function newClaudeTopic(prompt: string) {
+  otel.log("claude topic opened", { with_prompt: Boolean(prompt) });
   const topic = await tg.call<{ message_thread_id: number }>("createForumTopic", {
     chat_id: CHAT,
     name: "claude",
@@ -134,6 +143,9 @@ async function toClaude(thread: number, text: string, messageId?: number) {
   // Slash commands such as /cost or /model answer on screen without ending a turn: show the screen.
   if (text.startsWith("/")) scheduleScreen(thread, 2500);
   else {
+    l.turnEnd?.({}, "superseded by a new prompt");
+    l.turnEnd = otel.span("claude.turn", { thread });
+    l.tools = 0;
     turnDraft(thread).show("");
     stopTyping.get(thread)?.();
     stopTyping.set(thread, typing(thread));
@@ -235,6 +247,7 @@ async function reapIdle() {
   for (const { thread } of victims) {
     tmux.closeWindow(thread);
     console.log(`reaped idle session t${thread}`);
+    otel.log("session reaped", { thread, memory_available_mb: Math.round(memAvailableMb()) });
     await tg.send(CHAT, thread, "💤 Paused to free memory. Your next message resumes this session.", {
       disable_notification: true,
     }).catch(() => {});
@@ -242,6 +255,11 @@ async function reapIdle() {
 }
 
 setInterval(() => reapIdle().catch(console.error), 600_000);
+setInterval(() => {
+  const sessions = Object.keys(state.topics).filter((t) => tmux.hasWindow(Number(t))).length;
+  otel.gauge("tgmux.sessions", sessions);
+  otel.gauge("system.memory.available", Math.round(memAvailableMb()), "MiBy");
+}, 60_000);
 setTimeout(() => reapIdle().catch(console.error), 60_000);
 
 // ---------- files: Telegram -> ./inbox, TGMUX_OUTBOX -> Telegram ----------
@@ -332,11 +350,15 @@ async function onHook(event: string, thread: number, body: any) {
   }
   if (event === "tool") {
     clearTimeout(l.screenTimer);
+    l.turnEnd ??= otel.span("claude.turn", { thread });
+    l.tools = (l.tools ?? 0) + 1;
     if (!stopTyping.has(thread)) stopTyping.set(thread, typing(thread));
     const sofar = turnText(body.transcript_path);
     turnDraft(thread).show(`${sofar}${sofar ? "\n\n" : ""}${describeTool(body.tool_name, body.tool_input)}`);
   }
   if (event === "stop") {
+    l.turnEnd?.({ tools: l.tools ?? 0, reply_chars: String(body.last_assistant_message ?? "").length });
+    l.turnEnd = undefined;
     clearTimeout(l.screenTimer);
     l.draft?.end();
     stopTyping.get(thread)?.();
@@ -381,12 +403,14 @@ async function runShell(command: string, messageId?: number) {
   };
   const draft = (shellDraft = new Draft(tg, CHAT, state.shellThread, { parse_mode: "HTML" }));
   draft.show(render(""));
+  const end = otel.span("shell.command", { program: command.trim().split(/\s+/)[0] });
   const code = await shell.run(command, (s) => {
     out += s;
     draft.show(render(""));
   });
   draft.end();
   stop();
+  end({ exit_code: code, output_chars: out.length }, code === 0 ? undefined : `exit ${code}`);
   react(messageId, code === 0 ? "👌" : "👎");
   out = out.replace(/\n$/, "");
   await tg.send(CHAT, state.shellThread, render(code === 0 ? "" : `\nexit ${code}`), {
@@ -486,12 +510,14 @@ async function poll() {
         if (u.callback_query) onAnswer(u.callback_query).catch(console.error);
         if (u.message) onMessage(u.message).catch(async (e) => {
           console.error(e);
+          otel.log(`message failed: ${e.message ?? e}`, {}, "ERROR");
           const thread = u.message!.is_topic_message ? u.message!.message_thread_id : undefined;
           await tg.send(u.message!.chat.id, thread, `tgmux error: ${e.message ?? e}`).catch(() => {});
         });
       }
     } catch (e) {
       console.error(e);
+      otel.log(`poll failed: ${e}`, {}, "WARN");
       await Bun.sleep(3000);
     }
   }
@@ -524,4 +550,5 @@ if (me.has_topics_enabled && CHAT && !state.shellThread) {
   await tg.send(CHAT, state.shellThread, HELP);
 }
 console.log(`tgmux up: @${me.username} owner=${CHAT} workdir=${WORKDIR}`);
+otel.log("tgmux up", { bot: me.username, topics_enabled: Boolean(me.has_topics_enabled) });
 poll();
