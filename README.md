@@ -42,7 +42,7 @@ Then in Telegram:
 | Topic | `/keys Down Enter` | Presses keys (tmux key names), for pickers and menus |
 | Topic | `/kill` | Ends the session and closes the topic |
 
-Closing a topic in Telegram also ends its session. A topic whose tmux window is gone resumes its Claude session on the next message.
+Closing a topic in Telegram also ends its session. Idle sessions are closed to save memory, and a topic whose tmux window is gone resumes its Claude session on the next message.
 
 ## How it works
 
@@ -64,6 +64,7 @@ Claude Code runs with a generated `--settings` file whose hooks post back to tgm
 | `TGMUX_WORKDIR` | `~/work` | Shell and Claude working directory |
 | `TGMUX_MODEL` | `opus` | Claude Code model |
 | `TGMUX_PORT` | `8765` | Local port for hooks |
+| `TGMUX_IDLE_HOURS` | `2` | Close a Claude session idle this long (or sooner under memory pressure); the next message resumes it |
 
 ## Security
 

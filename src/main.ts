@@ -17,6 +17,7 @@ const CHAT = Number(env("TGMUX_OWNER", "0"));
 const WORKDIR = env("TGMUX_WORKDIR", join(homedir(), "work"));
 const STATE_DIR = env("TGMUX_STATE", join(homedir(), ".local/state/tgmux"));
 const PORT = Number(env("TGMUX_PORT", "8765"));
+const IDLE_HOURS = Number(env("TGMUX_IDLE_HOURS", "2"));
 const CLAUDE = env("TGMUX_CLAUDE", join(homedir(), ".local/bin/claude"));
 const HOOK_KEY = crypto.randomUUID();
 const INBOX = join(WORKDIR, "inbox");
@@ -32,7 +33,7 @@ mkdirSync(STATE_DIR, { recursive: true });
 
 // ---------- state: which topic runs which Claude session ----------
 
-type Topic = { sessionId?: string; named?: boolean; firstPrompt?: string };
+type Topic = { sessionId?: string; named?: boolean; firstPrompt?: string; lastActive?: number };
 const STATE_FILE = join(STATE_DIR, "state.json");
 const state: { topics: Record<string, Topic>; shellThread?: number } = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
@@ -126,10 +127,9 @@ async function toClaude(thread: number, text: string, messageId?: number) {
     await tg.send(CHAT, thread, topic.sessionId ? "Resuming the session…" : "Starting Claude…");
     await startClaude(thread, topic.sessionId);
   }
-  if (!topic.firstPrompt && !text.startsWith("/")) {
-    topic.firstPrompt = text;
-    save();
-  }
+  if (!topic.firstPrompt && !text.startsWith("/")) topic.firstPrompt = text;
+  topic.lastActive = Date.now();
+  save();
   await tmux.sendText(thread, text);
   // Slash commands such as /cost or /model answer on screen without ending a turn: show the screen.
   if (text.startsWith("/")) scheduleScreen(thread, 2500);
@@ -215,6 +215,35 @@ function typing(thread: number | undefined) {
   return () => clearInterval(timer);
 }
 
+// ---------- idle sessions: free memory, resume on the next message ----------
+
+function memAvailableMb() {
+  const m = readFileSync("/proc/meminfo", "utf8").match(/MemAvailable:\s+(\d+)/);
+  return m ? Number(m[1]) / 1024 : Infinity;
+}
+
+async function reapIdle() {
+  const now = Date.now();
+  const running = Object.entries(state.topics)
+    .map(([t, topic]) => ({ thread: Number(t), idle: now - (topic.lastActive ?? 0) }))
+    .filter(({ thread }) => tmux.hasWindow(thread) && !live.get(thread)?.draft?.active)
+    .sort((a, b) => b.idle - a.idle);
+  const victims = running.filter((r) => r.idle > IDLE_HOURS * 3_600_000);
+  // Under memory pressure also take the longest-idle session that has been quiet for 10 minutes.
+  const spare = running.find((r) => r.idle > 600_000 && !victims.includes(r));
+  if (memAvailableMb() < 400 && spare) victims.push(spare);
+  for (const { thread } of victims) {
+    tmux.closeWindow(thread);
+    console.log(`reaped idle session t${thread}`);
+    await tg.send(CHAT, thread, "💤 Paused to free memory. Your next message resumes this session.", {
+      disable_notification: true,
+    }).catch(() => {});
+  }
+}
+
+setInterval(() => reapIdle().catch(console.error), 600_000);
+setTimeout(() => reapIdle().catch(console.error), 60_000);
+
 // ---------- files: Telegram -> ./inbox, TGMUX_OUTBOX -> Telegram ----------
 
 /** Save an attachment to the inbox; returns its path, or undefined for a message without one. */
@@ -288,6 +317,7 @@ function describeTool(name: string, input: Record<string, any> = {}) {
 async function onHook(event: string, thread: number, body: any) {
   const l = liveOf(thread);
   const topic = (state.topics[thread] ??= {});
+  topic.lastActive = Date.now();
   if (body.session_id && topic.sessionId !== body.session_id) {
     topic.sessionId = body.session_id;
     save();
