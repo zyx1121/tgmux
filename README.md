@@ -65,6 +65,7 @@ Claude Code runs with a generated `--settings` file whose hooks post back to tgm
 | `TGMUX_MODEL` | `opus` | Claude Code model |
 | `TGMUX_PORT` | `8765` | Local port for hooks |
 | `TGMUX_IDLE_HOURS` | `2` | Close a Claude session idle this long (or sooner under memory pressure); the next message resumes it |
+| `SENSORIUM_URL`, `SENSORIUM_TOKEN` | unset | OTLP/HTTP JSON export: `claude.turn` and `shell.command` spans, event logs, `tgmux.sessions` and memory gauges |
 
 ## Security
 
