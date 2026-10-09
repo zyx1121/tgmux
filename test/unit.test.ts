@@ -30,3 +30,12 @@ test("shellLine survives quotes, pipes and background jobs", async () => {
   const out = await new Response(p.stdout).text();
   expect(out).toBe(`A'b\ndone\n\n${marker}:0\n`);
 });
+
+import { buildMenu, unalias } from "../src/commands";
+
+test("buildMenu maps Claude names onto Telegram's charset and keeps tgmux commands first", () => {
+  const { menu, aliases } = buildMenu([{ command: "help", description: "tgmux" }], ["help", "code-review", "model"]);
+  expect(menu.map((c) => c.command)).toEqual(["help", "code_review", "model"]);
+  expect(unalias("/code_review high", aliases)).toBe("/code-review high");
+  expect(unalias("/model opus", aliases)).toBe("/model opus");
+});

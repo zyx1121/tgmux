@@ -9,9 +9,17 @@ export type Message = {
   text?: string;
   forum_topic_closed?: object;
   forum_topic_created?: { name: string };
+  reply_markup?: { inline_keyboard?: { text: string; callback_data?: string }[][] };
 };
 
-export type Update = { update_id: number; message?: Message };
+export type CallbackQuery = { id: string; from: { id: number }; data?: string; message?: Message };
+
+export type Update = {
+  update_id: number;
+  message?: Message;
+  callback_query?: CallbackQuery;
+  stopped_message_generation?: { chat: { id: number }; message_thread_id?: number; draft_id: number };
+};
 
 export const MAX_TEXT = 4000;
 
@@ -39,8 +47,8 @@ export class Telegram {
     });
   }
 
-  async sendLong(chat: number, thread: number | undefined, text: string) {
-    for (const part of chunk(text || "(empty)")) await this.send(chat, thread, part);
+  async sendLong(chat: number, thread: number | undefined, text: string, replyTo?: number) {
+    for (const part of chunk(text || "(empty)")) await this.send(chat, thread, part, quote(replyTo));
   }
 
   edit(chat: number, message: number, text: string, extra: Record<string, unknown> = {}) {
@@ -71,6 +79,11 @@ export function chunk(text: string, size = MAX_TEXT): string[] {
   }
   if (rest) parts.push(rest);
   return parts;
+}
+
+/** Reply to the message that asked, so the answer quotes it instead of the topic's opening line. */
+export function quote(messageId?: number) {
+  return messageId ? { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } } : {};
 }
 
 export function escapeHtml(s: string) {

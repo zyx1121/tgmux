@@ -1,17 +1,19 @@
-// tgmux: a Telegram forum group as a terminal multiplexer.
-// General topic = a persistent bash. `/claude` = a new topic running interactive Claude Code in tmux.
+// tgmux: your private chat with the bot, in topic mode, as a terminal multiplexer.
+// The `shell` topic = a persistent bash. Every other topic = interactive Claude Code in a tmux window.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { buildMenu, claudeCommands, unalias } from "./commands";
+import { Draft } from "./draft";
 import { Shell } from "./shell";
-import { Telegram, escapeHtml, parseCommand, stripBotSuffix, type Message, type Update } from "./telegram";
+import { Telegram, escapeHtml, quote, parseCommand, stripBotSuffix, type CallbackQuery, type Message, type Update } from "./telegram";
 import * as tmux from "./tmux";
 
 const env = (k: string, d?: string) => process.env[k] ?? d ?? "";
 const TOKEN = env("TELEGRAM_BOT_TOKEN");
-const CHAT = Number(env("TGMUX_CHAT", "0"));
-const OWNERS = env("TGMUX_OWNERS").split(",").filter(Boolean).map(Number);
+// The owner's Telegram user id; in a private chat it is also the chat id.
+const CHAT = Number(env("TGMUX_OWNER", "0"));
 const WORKDIR = env("TGMUX_WORKDIR", join(homedir(), "work"));
 const STATE_DIR = env("TGMUX_STATE", join(homedir(), ".local/state/tgmux"));
 const PORT = Number(env("TGMUX_PORT", "8765"));
@@ -26,12 +28,13 @@ mkdirSync(STATE_DIR, { recursive: true });
 
 type Topic = { sessionId?: string; named?: boolean; firstPrompt?: string };
 const STATE_FILE = join(STATE_DIR, "state.json");
-const state: { topics: Record<string, Topic> } = existsSync(STATE_FILE)
+const state: { topics: Record<string, Topic>; shellThread?: number } = existsSync(STATE_FILE)
   ? JSON.parse(readFileSync(STATE_FILE, "utf8"))
   : { topics: {} };
 const save = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 
 const tg = new Telegram(TOKEN);
+let aliases = new Map<string, string>();
 const shell = new Shell(WORKDIR);
 
 // ---------- Claude Code setup: hooks report back to this process ----------
@@ -68,7 +71,7 @@ function writeClaudeSettings() {
 
 // ---------- per-topic runtime (not persisted) ----------
 
-type Live = { status?: number; started?: () => void; screenTimer?: Timer };
+type Live = { draft?: Draft; started?: () => void; screenTimer?: Timer; asked?: number };
 const live = new Map<number, Live>();
 const liveOf = (t: number) => live.get(t) ?? (live.set(t, {}), live.get(t)!);
 
@@ -106,8 +109,11 @@ async function newClaudeTopic(prompt: string) {
   else await tg.send(CHAT, thread, "Claude is ready.");
 }
 
-async function toClaude(thread: number, text: string) {
+async function toClaude(thread: number, text: string, messageId?: number) {
   const topic = (state.topics[thread] ??= {});
+  const l = liveOf(thread);
+  react(messageId, "👀");
+  l.asked = messageId;
   if (!tmux.hasWindow(thread)) {
     await tg.send(CHAT, thread, topic.sessionId ? "Resuming the session…" : "Starting Claude…");
     await startClaude(thread, topic.sessionId);
@@ -119,6 +125,41 @@ async function toClaude(thread: number, text: string) {
   await tmux.sendText(thread, text);
   // Slash commands such as /cost or /model answer on screen without ending a turn: show the screen.
   if (text.startsWith("/")) scheduleScreen(thread, 2500);
+  else {
+    turnDraft(thread).show("");
+    stopTyping.get(thread)?.();
+    stopTyping.set(thread, typing(thread));
+  }
+}
+
+const stopTyping = new Map<number, () => void>();
+
+/** The draft streaming the current Claude turn in a topic, created on first use. */
+function turnDraft(thread: number) {
+  const l = liveOf(thread);
+  if (!l.draft?.active) l.draft = new Draft(tg, CHAT, thread);
+  return l.draft;
+}
+
+/** Assistant text written so far in the current turn, read from the session transcript. */
+function turnText(transcriptPath?: string) {
+  if (!transcriptPath || !existsSync(transcriptPath)) return "";
+  const lines = readFileSync(transcriptPath, "utf8").trimEnd().split("\n").slice(-300);
+  let texts: string[] = [];
+  for (const line of lines) {
+    let e: any;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const content = e.message?.content;
+    // A real user prompt (string content) starts a new turn; tool results are arrays.
+    if (e.type === "user" && typeof content === "string") texts = [];
+    if (e.type === "assistant" && Array.isArray(content))
+      for (const c of content) if (c.type === "text" && c.text.trim()) texts.push(c.text.trim());
+  }
+  return texts.join("\n\n");
 }
 
 function scheduleScreen(thread: number, ms: number) {
@@ -146,6 +187,58 @@ async function nameTopic(thread: number, reply: string) {
   if (title) await tg.call("editForumTopic", { chat_id: CHAT, message_thread_id: thread, name: title }).catch(console.error);
 }
 
+// ---------- feedback: reactions on your message, "typing…" while work runs ----------
+
+function react(message: number | undefined, emoji?: string) {
+  if (!message) return;
+  tg.call("setMessageReaction", {
+    chat_id: CHAT,
+    message_id: message,
+    reaction: emoji ? [{ type: "emoji", emoji }] : [],
+  }).catch((e) => console.error(String(e)));
+}
+
+/** Show "typing…" in the thread until the returned function is called (Telegram clears it after 5 s). */
+function typing(thread: number | undefined) {
+  const tick = () =>
+    tg.call("sendChatAction", { chat_id: CHAT, message_thread_id: thread, action: "typing" }).catch(() => {});
+  tick();
+  const timer = setInterval(tick, 4000);
+  return () => clearInterval(timer);
+}
+
+// ---------- AskUserQuestion: Claude's picker as inline buttons ----------
+
+type Question = { question: string; header?: string; options?: { label: string; description?: string }[] };
+
+async function askButtons(thread: number, questions: Question[]) {
+  for (const [qi, q] of questions.entries()) {
+    const options = q.options ?? [];
+    const lines = options.map((o, i) => `${i + 1}. ${o.label}${o.description ? `: ${o.description}` : ""}`);
+    await tg.send(CHAT, thread, [q.question, "", ...lines].join("\n"), {
+      reply_markup: {
+        inline_keyboard: options.map((o, oi) => [{ text: o.label, callback_data: `q:${qi}:${oi}` }]),
+      },
+    });
+  }
+}
+
+/** A picker button: move the highlight to that option and press Enter, as a person would. */
+async function onAnswer(cb: CallbackQuery) {
+  await tg.call("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
+  const m = cb.data?.match(/^q:(\d+):(\d+)$/);
+  const msg = cb.message;
+  if (!m || !msg?.message_thread_id || cb.from.id !== CHAT) return;
+  const thread = msg.message_thread_id;
+  tmux.sendKeys(thread, [...Array(Number(m[2])).fill("Down"), "Enter"]);
+  const chosen = msg.reply_markup?.inline_keyboard?.[Number(m[2])]?.[0]?.text ?? "";
+  await tg.call("editMessageReplyMarkup", { chat_id: CHAT, message_id: msg.message_id }).catch(() => {});
+  await tg.send(CHAT, thread, `✓ ${chosen}`, { disable_notification: true });
+  turnDraft(thread).show("");
+  stopTyping.get(thread)?.();
+  stopTyping.set(thread, typing(thread));
+}
+
 // ---------- hooks from Claude Code ----------
 
 function describeTool(name: string, input: Record<string, any> = {}) {
@@ -161,19 +254,30 @@ async function onHook(event: string, thread: number, body: any) {
     save();
   }
   if (event === "start") l.started?.();
+  if (event === "tool" && body.tool_name === "AskUserQuestion") {
+    clearTimeout(l.screenTimer);
+    l.draft?.end();
+    stopTyping.get(thread)?.();
+    await askButtons(thread, body.tool_input?.questions ?? []);
+    return;
+  }
   if (event === "tool") {
     clearTimeout(l.screenTimer);
-    const text = describeTool(body.tool_name, body.tool_input);
-    if (l.status) await tg.edit(CHAT, l.status, text);
-    else l.status = (await tg.send(CHAT, thread, text, { disable_notification: true })).message_id;
+    if (!stopTyping.has(thread)) stopTyping.set(thread, typing(thread));
+    const sofar = turnText(body.transcript_path);
+    turnDraft(thread).show(`${sofar}${sofar ? "\n\n" : ""}${describeTool(body.tool_name, body.tool_input)}`);
   }
   if (event === "stop") {
     clearTimeout(l.screenTimer);
-    if (l.status) await tg.call("deleteMessage", { chat_id: CHAT, message_id: l.status }).catch(() => {});
-    l.status = undefined;
+    l.draft?.end();
+    stopTyping.get(thread)?.();
+    stopTyping.delete(thread);
+    const asked = l.asked;
+    react(asked, "👌");
+    l.asked = undefined;
     const reply = String(body.last_assistant_message ?? "").trim();
     if (reply) {
-      await tg.sendLong(CHAT, thread, reply);
+      await tg.sendLong(CHAT, thread, reply, asked);
       nameTopic(thread, reply).catch(console.error);
     }
   }
@@ -195,36 +299,55 @@ Bun.serve({
 
 // ---------- General topic: the shell ----------
 
-async function runShell(command: string) {
-  const msg = await tg.send(CHAT, undefined, `$ ${command}\n…`);
+let shellDraft: Draft | undefined;
+
+async function runShell(command: string, messageId?: number) {
+  react(messageId, "👀");
+  const stop = typing(state.shellThread);
   let out = "";
-  let dirty = false;
   const render = (footer: string) => {
     const tail = out.length > 3500 ? `…\n${out.slice(-3500)}` : out;
     return `<pre><code class="language-shell">${escapeHtml(`$ ${command}\n${tail}`.trimEnd())}</code></pre>${footer}`;
   };
-  const timer = setInterval(() => {
-    if (dirty) tg.edit(CHAT, msg.message_id, render("\n…"), { parse_mode: "HTML" });
-    dirty = false;
-  }, 1500);
+  const draft = (shellDraft = new Draft(tg, CHAT, state.shellThread, { parse_mode: "HTML" }));
+  draft.show(render(""));
   const code = await shell.run(command, (s) => {
     out += s;
-    dirty = true;
+    draft.show(render(""));
   });
-  clearInterval(timer);
+  draft.end();
+  stop();
+  react(messageId, code === 0 ? "👌" : "👎");
   out = out.replace(/\n$/, "");
-  await tg.edit(CHAT, msg.message_id, render(code === 0 ? "" : `\nexit ${code}`), { parse_mode: "HTML" });
-  if (out.length > 3500) await tg.sendDocument(CHAT, undefined, "output.txt", out);
+  await tg.send(CHAT, state.shellThread, render(code === 0 ? "" : `\nexit ${code}`), {
+    parse_mode: "HTML",
+    ...quote(messageId),
+  });
+  if (out.length > 3500) await tg.sendDocument(CHAT, state.shellThread, "output.txt", out);
+}
+
+/** The draft's stop button: interrupt the shell command or Claude's turn it belongs to. */
+function onStopped(thread: number | undefined, draftId: number) {
+  if (thread === undefined || thread === state.shellThread) {
+    if (shellDraft?.id === draftId) shell.interrupt();
+    return;
+  }
+  const l = liveOf(thread);
+  if (l.draft?.id !== draftId) return;
+  l.draft.end();
+  tmux.sendKeys(thread, ["Escape"]);
 }
 
 const HELP = [
-  "General topic",
+  "New thread: a new Claude Code session (type anything in the main chat)",
+  "",
+  "shell topic",
   "  any text: runs in bash (pipes, &&, & all work; cd persists)",
-  "  /claude [prompt]: open a new Claude topic",
-  "  /stop: interrupt the running command",
+  "  /claude [prompt]: open a new Claude topic from here",
+  "  /stop or the draft's stop button: interrupt the running command",
   "",
   "Claude topic",
-  "  any text or /command: goes to Claude Code",
+  "  any text or /command: goes to Claude Code (the stop button sends Esc)",
   "  /screen: show the terminal",
   "  /keys Down Enter: press keys (tmux key names)",
   "  /kill: end the session and close the topic",
@@ -233,7 +356,7 @@ const HELP = [
 // ---------- routing ----------
 
 async function onMessage(msg: Message) {
-  if (msg.chat.id !== CHAT || !OWNERS.includes(msg.from?.id ?? 0)) {
+  if (msg.chat.type !== "private" || msg.chat.id !== CHAT || msg.from?.id !== CHAT) {
     console.log(`ignored chat=${msg.chat.id} (${msg.chat.title ?? msg.chat.type}) from=${msg.from?.id}`);
     return;
   }
@@ -246,13 +369,14 @@ async function onMessage(msg: Message) {
   const text = stripBotSuffix(msg.text);
   const cmd = parseCommand(text);
 
-  if (thread === undefined) {
+  if (thread === undefined || thread === state.shellThread) {
     if (cmd?.cmd === "claude") return newClaudeTopic(cmd.args);
     if (cmd?.cmd === "stop") return shell.interrupt();
-    if (cmd?.cmd === "help" || cmd?.cmd === "start") return tg.send(CHAT, undefined, HELP);
-    return runShell(text);
+    if (cmd?.cmd === "help" || cmd?.cmd === "start") return tg.send(CHAT, state.shellThread, HELP);
+    return runShell(text, msg.message_id);
   }
 
+  if (cmd?.cmd === "help") return tg.send(CHAT, thread, HELP);
   if (cmd?.cmd === "screen") return sendScreen(thread);
   if (cmd?.cmd === "keys") {
     tmux.sendKeys(thread, cmd.args.split(/\s+/).filter(Boolean));
@@ -264,16 +388,23 @@ async function onMessage(msg: Message) {
     save();
     return tg.call("closeForumTopic", { chat_id: CHAT, message_thread_id: thread });
   }
-  return toClaude(thread, text);
+  return toClaude(thread, unalias(text, aliases), msg.message_id);
 }
 
 async function poll() {
   let offset = 0;
   for (;;) {
     try {
-      const updates = await tg.call<Update[]>("getUpdates", { offset, timeout: 30, allowed_updates: ["message"] });
+      const updates = await tg.call<Update[]>("getUpdates", {
+        offset,
+        timeout: 30,
+        allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+      });
       for (const u of updates) {
         offset = u.update_id + 1;
+        const stop = u.stopped_message_generation;
+        if (stop?.chat.id === CHAT) onStopped(stop.message_thread_id, stop.draft_id);
+        if (u.callback_query) onAnswer(u.callback_query).catch(console.error);
         if (u.message) onMessage(u.message).catch(async (e) => {
           console.error(e);
           const thread = u.message!.is_topic_message ? u.message!.message_thread_id : undefined;
@@ -288,13 +419,29 @@ async function poll() {
 }
 
 writeClaudeSettings();
-await tg.call("setMyCommands", {
-  commands: [
-    { command: "claude", description: "Open a new Claude topic" },
-    { command: "screen", description: "Show the Claude terminal" },
-    { command: "stop", description: "Interrupt the shell" },
-    { command: "help", description: "Usage" },
-  ],
-}).catch(console.error);
-console.log(`tgmux up: chat=${CHAT} owners=${OWNERS.join(",")} workdir=${WORKDIR}`);
+const OWN_COMMANDS = [
+  { command: "claude", description: "tgmux: open a new Claude topic" },
+  { command: "screen", description: "tgmux: show the Claude terminal" },
+  { command: "keys", description: "tgmux: press keys, e.g. /keys Down Enter" },
+  { command: "kill", description: "tgmux: end this Claude session" },
+  { command: "stop", description: "tgmux: interrupt the shell" },
+  { command: "help", description: "tgmux: usage" },
+];
+// The menu lists Claude Code's commands too; refreshed on every start, so new skills appear after a restart.
+claudeCommands(CLAUDE, WORKDIR)
+  .then((names) => {
+    const built = buildMenu(OWN_COMMANDS, names);
+    aliases = built.aliases;
+    return tg.call("setMyCommands", { commands: built.menu });
+  })
+  .catch(console.error);
+const me = await tg.call<{ username: string; has_topics_enabled?: boolean }>("getMe");
+if (!me.has_topics_enabled) console.warn(`@${me.username}: turn on threaded mode in the @BotFather Mini App`);
+if (me.has_topics_enabled && CHAT && !state.shellThread) {
+  const t = await tg.call<{ message_thread_id: number }>("createForumTopic", { chat_id: CHAT, name: "shell" });
+  state.shellThread = t.message_thread_id;
+  save();
+  await tg.send(CHAT, state.shellThread, HELP);
+}
+console.log(`tgmux up: @${me.username} owner=${CHAT} workdir=${WORKDIR}`);
 poll();
