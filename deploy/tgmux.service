@@ -1,0 +1,19 @@
+[Unit]
+Description=tgmux: Telegram forum group as a shell and Claude Code multiplexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=user
+WorkingDirectory=/home/user/tgmux
+EnvironmentFile=/home/user/.config/tgmux/env
+Environment=PATH=/home/user/.local/bin:/home/user/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/user
+ExecStart=/home/user/.bun/bin/bun src/main.ts
+Restart=always
+RestartSec=3
+# Only stop the bot itself: the tmux server and its Claude sessions survive restarts and deploys.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
