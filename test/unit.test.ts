@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { paceStep } from "../src/draft";
 import { shellLine } from "../src/shell";
 import { chunk, parseCommand, stripBotSuffix } from "../src/telegram";
 
@@ -47,4 +48,21 @@ test("chunkMarkdown closes and reopens a code fence split across parts", () => {
   const parts = chunkMarkdown(`intro\n\`\`\`ts\n${code}\n\`\`\`\nouter`, 200);
   for (const p of parts) expect((p.match(/^```/gm) ?? []).length % 2).toBe(0);
   expect(parts[1].startsWith("```ts\n")).toBe(true);
+});
+
+test("paceStep types new text out in steps and backs off on rewrites", () => {
+  const target = "x".repeat(600);
+  let shown = "";
+  let steps = 0;
+  while (shown !== target) {
+    const next = paceStep(shown, target);
+    expect(next.length).toBeGreaterThan(shown.length);
+    shown = next;
+    steps++;
+  }
+  expect(steps).toBeGreaterThan(3);
+  expect(steps).toBeLessThan(25);
+  expect(paceStep("hello\n\n🔧 Bash ls", "hello world")).toBe("hello");
+  expect(paceStep("ab", "ab😀c").length).toBeLessThanOrEqual(5);
+  expect(paceStep("ab", "ab😀c")).not.toMatch(/[\uD800-\uDBFF]$/);
 });
