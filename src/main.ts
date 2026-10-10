@@ -86,6 +86,11 @@ type Live = {
   asked?: number;
   turnEnd?: ReturnType<typeof otel.span>;
   tools?: number;
+  transcript?: string;
+  /** Where the current turn starts in the transcript, so the previous turn never leaks into the draft. */
+  turnFrom?: { path: string; offset: number };
+  tool?: string;
+  poll?: Timer;
 };
 const live = new Map<number, Live>();
 const liveOf = (t: number) => live.get(t) ?? (live.set(t, {}), live.get(t)!);
@@ -146,7 +151,7 @@ async function toClaude(thread: number, text: string, messageId?: number) {
     l.turnEnd?.({}, "superseded by a new prompt");
     l.turnEnd = otel.span("claude.turn", { thread });
     l.tools = 0;
-    turnDraft(thread).show("");
+    beginTurn(thread);
     stopTyping.get(thread)?.();
     stopTyping.set(thread, typing(thread));
   }
@@ -157,14 +162,51 @@ const stopTyping = new Map<number, () => void>();
 /** The draft streaming the current Claude turn in a topic, created on first use. */
 function turnDraft(thread: number) {
   const l = liveOf(thread);
-  if (!l.draft?.active) l.draft = new Draft(tg, CHAT, thread);
+  if (!l.draft?.active) l.draft = new Draft(tg, CHAT, thread, {}, { pace: true });
   return l.draft;
 }
 
+/** Start streaming a turn: mark where it begins and follow the transcript as Claude writes it. */
+function beginTurn(thread: number) {
+  const l = liveOf(thread);
+  l.tool = undefined;
+  if (l.transcript && existsSync(l.transcript))
+    l.turnFrom = { path: l.transcript, offset: statSync(l.transcript).size };
+  turnDraft(thread).show("");
+  followTurn(thread);
+}
+
+function followTurn(thread: number) {
+  const l = liveOf(thread);
+  clearInterval(l.poll);
+  l.poll = setInterval(() => refreshDraft(thread), 1000);
+}
+
+function stopFollowing(thread: number) {
+  const l = liveOf(thread);
+  clearInterval(l.poll);
+  l.poll = undefined;
+}
+
+/** Text written so far in this turn plus the tool running now. */
+function draftText(thread: number) {
+  const l = liveOf(thread);
+  const sofar = turnText(l.transcript, l.turnFrom);
+  return `${sofar}${sofar && l.tool ? "\n\n" : ""}${l.tool ?? ""}`;
+}
+
+function refreshDraft(thread: number) {
+  const l = liveOf(thread);
+  if (l.draft?.active) l.draft.show(draftText(thread));
+  else stopFollowing(thread);
+}
+
 /** Assistant text written so far in the current turn, read from the session transcript. */
-function turnText(transcriptPath?: string) {
+function turnText(transcriptPath?: string, from?: { path: string; offset: number }) {
   if (!transcriptPath || !existsSync(transcriptPath)) return "";
-  const lines = readFileSync(transcriptPath, "utf8").trimEnd().split("\n").slice(-300);
+  const offset = from?.path === transcriptPath ? from.offset : 0;
+  const raw = readFileSync(transcriptPath).subarray(offset).toString("utf8");
+  const lines = raw.trimEnd().split("\n").slice(-300);
   let texts: string[] = [];
   for (const line of lines) {
     let e: any;
@@ -317,10 +359,12 @@ async function onAnswer(cb: CallbackQuery) {
   if (!m || !msg?.message_thread_id || cb.from.id !== CHAT) return;
   const thread = msg.message_thread_id;
   tmux.sendKeys(thread, [...Array(Number(m[2])).fill("Down"), "Enter"]);
+  liveOf(thread).draft?.end();
   const chosen = msg.reply_markup?.inline_keyboard?.[Number(m[2])]?.[0]?.text ?? "";
   await tg.call("editMessageReplyMarkup", { chat_id: CHAT, message_id: msg.message_id }).catch(() => {});
   await tg.send(CHAT, thread, `✓ ${chosen}`, { disable_notification: true });
-  turnDraft(thread).show("");
+  turnDraft(thread).show(draftText(thread));
+  followTurn(thread);
   stopTyping.get(thread)?.();
   stopTyping.set(thread, typing(thread));
 }
@@ -340,9 +384,11 @@ async function onHook(event: string, thread: number, body: any) {
     topic.sessionId = body.session_id;
     save();
   }
+  if (body.transcript_path) l.transcript = body.transcript_path;
   if (event === "start") l.started?.();
   if (event === "tool" && body.tool_name === "AskUserQuestion") {
     clearTimeout(l.screenTimer);
+    stopFollowing(thread);
     l.draft?.end();
     stopTyping.get(thread)?.();
     await askButtons(thread, body.tool_input?.questions ?? []);
@@ -353,21 +399,25 @@ async function onHook(event: string, thread: number, body: any) {
     l.turnEnd ??= otel.span("claude.turn", { thread });
     l.tools = (l.tools ?? 0) + 1;
     if (!stopTyping.has(thread)) stopTyping.set(thread, typing(thread));
-    const sofar = turnText(body.transcript_path);
-    turnDraft(thread).show(`${sofar}${sofar ? "\n\n" : ""}${describeTool(body.tool_name, body.tool_input)}`);
+    l.tool = describeTool(body.tool_name, body.tool_input);
+    turnDraft(thread).show(draftText(thread));
+    if (!l.poll) followTurn(thread);
   }
   if (event === "stop") {
     l.turnEnd?.({ tools: l.tools ?? 0, reply_chars: String(body.last_assistant_message ?? "").length });
     l.turnEnd = undefined;
     clearTimeout(l.screenTimer);
-    l.draft?.end();
+    stopFollowing(thread);
+    const reply = String(body.last_assistant_message ?? "").trim();
+    // Type out the rest of the reply in the draft before the real message replaces it.
+    l.tool = undefined;
+    await l.draft?.finish(draftText(thread) || reply);
     stopTyping.get(thread)?.();
     stopTyping.delete(thread);
     const asked = l.asked;
     react(asked, "👌");
     l.asked = undefined;
     await deliverOutbox(thread);
-    const reply = String(body.last_assistant_message ?? "").trim();
     if (reply) {
       await tg.sendMarkdown(CHAT, thread, reply, asked);
       nameTopic(thread, reply).catch(console.error);
@@ -428,6 +478,7 @@ function onStopped(thread: number | undefined, draftId: number) {
   }
   const l = liveOf(thread);
   if (l.draft?.id !== draftId) return;
+  stopFollowing(thread);
   l.draft.end();
   tmux.sendKeys(thread, ["Escape"]);
 }
